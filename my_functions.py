@@ -4,8 +4,8 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 
-def calculate_samscore_by_epoch_and_patient(source_folder, generated_folder, output_json_file, samscore_class, selected_patients=None):
-    evaluator = samscore_class(model_type="vit_b")
+def calculate_samscore_by_epoch_and_patient(source_folder, generated_folder, output_json_file, evaluator, selected_patients=None):
+    #evaluator = samscore_class(model_type="vit_b")
 
     # Load existing scores if available
     if os.path.exists(output_json_file):
@@ -16,7 +16,7 @@ def calculate_samscore_by_epoch_and_patient(source_folder, generated_folder, out
         existing_data = {}
         existing_scores = {}
 
-    for epoch in [20, 25, 30, 35, 40, 45]:
+    for epoch in [5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,150,200,250,300,350,400]:
         for patient_id in range(1000):  # arbitrary upper bound for patient IDs
             key_str = f"e{epoch:03d}_p{patient_id:03d}"
             if key_str in existing_scores:
@@ -77,7 +77,7 @@ def samscore_per_epoch(json_path):
         data = json.load(f)
     scores = data["scores"]
 
-    fixed_epochs = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 100]
+    fixed_epochs = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55,60,65,70,75,80,85,90,95, 100]
     epoch_patient_scores = {epoch: [] for epoch in fixed_epochs}
 
     for key, val in scores.items():
