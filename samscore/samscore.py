@@ -12,7 +12,6 @@ import torchvision.transforms as transforms
 from PIL import Image, ImageDraw, ImageFont
 from segment_anything.utils.transforms import ResizeLongestSide
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
-from mobile_sam import sam_model_registry as mobile_sam_model_registry
 import torch.nn.functional as F
 import cv2
 import requests
@@ -138,67 +137,82 @@ def download_model(url,model_name,destination):
         print("Failed to download file. Status code:", response.status_code)
 
 
+import os
+import torch
+import torch.nn as nn
+from typing import Optional, Union
+
+# assume these are imported from your SAM libs
+# from segment_anything import sam_model_registry
+# from mobile_sam import mobile_sam_model_registry
+
 class SAMScore(nn.Module):
-    def __init__(self, model_type = "vit_l", model_weight_path = None ,version='1.0'):
-        """ Initializes a perceptual loss torch.nn.Module
+    """
+    A wrapper around SAM/MedSAM to compute a perceptual-style score.
 
-        Parameters (default listed first)
-        ---------------------------------
-        samscore : float
-            The SAM score between the source image and the generated image
-        model_type : str
-            The type of model to use for the SAM score. Currently only supports 'vit_l,vit_b,vit_h'
-        version : str
-            The version of the SAM model to use. Currently only supports '1.0'
-        source_image_path : str
-            The path to the source image
-        generated_image_path : str
-            The path to the generated image
-        
-        """
+    Args:
+        debug (bool): If True, force CPU-safe loading and extra logging.
+        model_type (str): 'vit_b', 'vit_l', 'vit_h', or 'vit_t' (mobile).
+        model_weight_path (str): Path to the .pth/.pt weights file.
+        version (str): Kept for API compatibility; not used internally.
 
-        super(SAMScore, self).__init__()
+    Notes:
+        - Power users can pass `debug=True` on clusters without GPUs.
+        - We avoid `checkpoint=torch.load(...dict...)` — we either give SAM a path
+          or we load and `load_state_dict` ourselves.
+    """
 
-        download_url = "https://dl.fbaipublicfiles.com/segment_anything/"
-        online_vit_b_model_name = "sam_vit_b_01ec64.pth"
-        online_vit_l_model_name = "sam_vit_l_0b3195.pth"
-        online_vit_h_model_name = "sam_vit_h_4b8939.pth"
-        online_vit_t_model_name = "mobile_sam.pt"
-      
-        
-        if model_weight_path is None:
-            if model_type == "vit_l":
-                online_model_weight_name = online_vit_l_model_name
-            elif model_type == "vit_b":
-                online_model_weight_name = online_vit_b_model_name
-            elif model_type == "vit_h":
-                online_model_weight_name = online_vit_h_model_name
-            elif model_type == "vit_t":
-                online_model_weight_name = online_vit_t_model_name
-                download_url = "https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/"
-                
-            else:
-                raise ValueError("model_type must be one of 'vit_l','vit_b','vit_h'")
-            
-        # to download the model weights from online link
-        if model_weight_path is None:
-            save_path = "weights"
-            destination_path = os.path.join(save_path,online_model_weight_name)
-            model_weight_path = destination_path
-
-            if not os.path.exists(destination_path):
-                os.makedirs(save_path,exist_ok=True)
-                download_model(url = download_url,model_name = online_model_weight_name, destination= destination_path)
-
-
+    def __init__(
+        self,
+        debug: bool,
+        model_type: str = "vit_b",
+        model_weight_path: Union[str, os.PathLike] = "weights/medsam_vit_b.pth",
+        version: str = "1.0",
+    ):
+        super().__init__()
         self.version = version
-        self.model_type = model_type
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        if model_type == "vit_t":
-            self.sam = mobile_sam_model_registry[model_type](checkpoint=model_weight_path)
+        self.model_type = model_type.lower().strip()
+
+        # Decide device early
+        self.device = torch.device("cuda" if torch.cuda.is_available() and not debug else "cpu")
+
+        # Validate path
+        model_weight_path = os.fspath(model_weight_path)
+        if not os.path.exists(model_weight_path):
+            raise FileNotFoundError(f"[SAMScore] Weights not found: {model_weight_path}")
+
+        # Build the bare model first (no checkpoint dict passed)
+        if self.model_type == "vit_t":
+            # Mobile SAM registry may accept `checkpoint=path`, but we’ll load explicitly for consistency
+            self.sam = mobile_sam_model_registry[self.model_type]()  # type: ignore
         else:
-            self.sam = sam_model_registry[self.model_type](checkpoint=model_weight_path)
-        self.sam.to(device=self.device)
+            self.sam = sam_model_registry[self.model_type]()  # type: ignore
+
+        # Load checkpoint safely
+        ckpt = torch.load(model_weight_path, map_location="cpu")  # always load to CPU first
+
+        # Unwrap common nested formats
+        if isinstance(ckpt, dict):
+            for k in ("model", "state_dict", "weights", "module"):
+                if k in ckpt and isinstance(ckpt[k], dict):
+                    ckpt = ckpt[k]
+                    break
+
+        # Load weights with tolerance for minor key diffs
+        missing, unexpected = self.sam.load_state_dict(ckpt, strict=False)
+        if debug:
+            if missing:
+                print(f"[SAMScore] Missing keys ({len(missing)}): {list(missing)[:10]}{' ...' if len(missing)>10 else ''}")
+            if unexpected:
+                print(f"[SAMScore] Unexpected keys ({len(unexpected)}): {list(unexpected)[:10]}{' ...' if len(unexpected)>10 else ''}")
+
+        # Finalize
+        self.sam.to(self.device)
+        self.sam.eval()
+        # Freeze params (usually desired for scoring)
+        for p in self.sam.parameters():
+            p.requires_grad = False
+
 
 
     def evaluation_from_path(self, source_image_path=None,  generated_image_path=None):
