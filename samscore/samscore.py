@@ -103,7 +103,21 @@ def sam_encode(sam_model, image, image_generated,device):
         return samscore
 
 
-def sam_encode_from_torch(sam_model, image, image_generated,device):
+def sam_encode_from_torch(sam_model, image, image_generated, device, requires_grad=False):
+    """
+    Compute SAM-based similarity score between two images.
+    
+    Args:
+        sam_model: The SAM model
+        image: Source image tensor
+        image_generated: Generated image tensor  
+        device: Device to run computation on
+        requires_grad: If True, allow gradients to flow through the computation.
+                      If False, wrap in torch.no_grad() for evaluation only.
+    
+    Returns:
+        SAM similarity score (higher is better)
+    """
     if sam_model is not None:
         sam_transform = ResizeLongestSide(sam_model.image_encoder.img_size)
         resampled_image = sam_transform.apply_image_torch(image).to(device)
@@ -116,10 +130,17 @@ def sam_encode_from_torch(sam_model, image, image_generated,device):
         assert resampled_image_generated.shape == (resampled_image.shape[0], 3, sam_model.image_encoder.img_size,
                                             sam_model.image_encoder.img_size), 'input image should be resized to 3*1024*1024'
 
-        with torch.no_grad():
+        if requires_grad:
+            # Allow gradients to flow for training loss
             embedding = sam_model.image_encoder(resampled_image)
             embedding_generated = sam_model.image_encoder(resampled_image_generated)
             samscore = cosine_similarity(embedding, embedding_generated)
+        else:
+            # Use no_grad for evaluation/logging only
+            with torch.no_grad():
+                embedding = sam_model.image_encoder(resampled_image)
+                embedding_generated = sam_model.image_encoder(resampled_image_generated)
+                samscore = cosine_similarity(embedding, embedding_generated)
         return samscore
 
 def download_model(url,model_name,destination):
@@ -222,7 +243,144 @@ class SAMScore(nn.Module):
         return samscore
 
 
-    def evaluation_from_torch(self,source,generated):
-        samscore = sam_encode_from_torch(self.sam,source,generated,device = self.device)
+    def evaluation_from_torch(self, source, generated, requires_grad=False):
+        """
+        Compute SAM score from PyTorch tensors.
+        
+        Args:
+            source: Source image tensor
+            generated: Generated image tensor
+            requires_grad: If True, allow gradients to flow (for training loss).
+                          If False, compute in no_grad mode (for logging/evaluation).
+        
+        Returns:
+            SAM similarity score
+        """
+        samscore = sam_encode_from_torch(self.sam, source, generated, device=self.device, requires_grad=requires_grad)
         return samscore
+
+    def _get_mask_generator(self):
+        """Lazy initialization of mask generator"""
+        if not hasattr(self, '_mask_generator'):
+            self._mask_generator = SamAutomaticMaskGenerator(
+                model=self.sam,
+                points_per_side=32,
+                pred_iou_thresh=0.86,
+                stability_score_thresh=0.92,
+                min_mask_region_area=100,
+            )
+        return self._mask_generator
+
+    def _tensor_to_numpy_image(self, tensor):
+        """Convert tensor [B, C, H, W] in [0, 255] to numpy [H, W, C] uint8"""
+        if tensor.dim() == 4:
+            tensor = tensor[0]  # Take first image in batch
+        # tensor is [C, H, W] in range [0, 255]
+        img = tensor.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        return img
+
+    def _generate_union_mask(self, image_tensor, top_k=10):
+        """
+        Generate union of top-K largest SAM masks for an image.
+        
+        Args:
+            image_tensor: Image tensor [B, C, H, W] in [0, 255]
+            top_k: Number of largest masks to include in union
+            
+        Returns:
+            Binary mask tensor [1, 1, H, W] on same device
+        """
+        img_np = self._tensor_to_numpy_image(image_tensor)
+        h, w = img_np.shape[:2]
+        
+        mask_generator = self._get_mask_generator()
+        
+        with torch.no_grad():
+            masks = mask_generator.generate(img_np)
+        
+        if len(masks) == 0:
+            # No masks found, return empty mask
+            return torch.zeros(1, 1, h, w, device=self.device, dtype=torch.float32)
+        
+        # Sort masks by area (largest first) and take top-K
+        masks_sorted = sorted(masks, key=lambda x: x['area'], reverse=True)[:top_k]
+        
+        # Create union mask
+        union_mask = np.zeros((h, w), dtype=np.float32)
+        for m in masks_sorted:
+            union_mask = np.maximum(union_mask, m['segmentation'].astype(np.float32))
+        
+        # Convert to tensor
+        mask_tensor = torch.from_numpy(union_mask).unsqueeze(0).unsqueeze(0).to(self.device)
+        return mask_tensor
+
+    def compute_iou_score(self, source, generated, top_k=10):
+        """
+        Compute IoU (Intersection over Union) between SAM mask unions.
+        
+        Args:
+            source: Source image tensor [B, C, H, W] in [0, 255]
+            generated: Generated image tensor [B, C, H, W] in [0, 255]
+            top_k: Number of largest masks to include in union
+            
+        Returns:
+            IoU score (higher is better, in [0, 1])
+        """
+        with torch.no_grad():
+            mask_source = self._generate_union_mask(source, top_k)
+            mask_generated = self._generate_union_mask(generated, top_k)
+            
+            intersection = (mask_source * mask_generated).sum()
+            union = ((mask_source + mask_generated) > 0).float().sum()
+            
+            if union == 0:
+                return torch.tensor(1.0, device=self.device)  # Both empty = perfect match
+            
+            iou = intersection / union
+        return iou
+
+    def compute_dice_score(self, source, generated, top_k=10):
+        """
+        Compute Dice coefficient between SAM mask unions.
+        
+        Args:
+            source: Source image tensor [B, C, H, W] in [0, 255]
+            generated: Generated image tensor [B, C, H, W] in [0, 255]
+            top_k: Number of largest masks to include in union
+            
+        Returns:
+            Dice score (higher is better, in [0, 1])
+        """
+        with torch.no_grad():
+            mask_source = self._generate_union_mask(source, top_k)
+            mask_generated = self._generate_union_mask(generated, top_k)
+            
+            intersection = (mask_source * mask_generated).sum()
+            sum_masks = mask_source.sum() + mask_generated.sum()
+            
+            if sum_masks == 0:
+                return torch.tensor(1.0, device=self.device)  # Both empty = perfect match
+            
+            dice = (2.0 * intersection) / sum_masks
+        return dice
+
+    def mask_consistency_score(self, source, generated, mode='iou', top_k=10):
+        """
+        Compute mask-based consistency score.
+        
+        Args:
+            source: Source image tensor
+            generated: Generated image tensor
+            mode: 'iou' for IoU score, 'dice' for Dice score
+            top_k: Number of largest masks to include
+            
+        Returns:
+            Consistency score (higher is better)
+        """
+        if mode == 'iou':
+            return self.compute_iou_score(source, generated, top_k)
+        elif mode == 'dice':
+            return self.compute_dice_score(source, generated, top_k)
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Use 'iou' or 'dice'.")
         
