@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+samscore/__pycache__/
+
+# Core dumps
+core.*
+
+# Experiment outputs (should be in parent repo checkpoints)
+cycle_gan_*/
+
+# Images (generated)
+imgs/*.png
+
+# SLURM logs
+*.out
+*.err
